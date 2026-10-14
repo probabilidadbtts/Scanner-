@@ -1,22 +1,51 @@
 """
-Over 0.5 HT Scanner
-Escanea partidos del día, obtiene xG, posesión y cuotas,
-y estima la probabilidad de Over 0.5 goles en primera parte.
+Over 0.5 HT Scanner + Telegram Notification
 """
 
 import os
-import sys
 import time
+import json
 import requests
-from datetime import date, datetime, timedelta
+from datetime import date
 
 API_KEY = os.environ["THESTATSAPI_KEY"]
+TG_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "")
+TG_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID", "")
+
 BASE = "https://api.thestatsapi.com/api"
 HEADERS = {"Authorization": f"Bearer {API_KEY}", "Accept": "application/json"}
 
 
+# ──────────────────────────────────────────────
+# TELEGRAM
+# ──────────────────────────────────────────────
+def send_telegram(text: str):
+    """Envía mensaje HTML a Telegram."""
+    if not TG_TOKEN or not TG_CHAT_ID:
+        print("⚠️  Telegram no configurado (faltan TELEGRAM_BOT_TOKEN o TELEGRAM_CHAT_ID)")
+        return
+
+    url = f"https://api.telegram.org/bot{TG_TOKEN}/sendMessage"
+    payload = {
+        "chat_id": TG_CHAT_ID,
+        "text": text,
+        "parse_mode": "HTML",
+        "disable_web_page_preview": True,
+    }
+    try:
+        resp = requests.post(url, json=payload, timeout=15)
+        if resp.status_code == 200:
+            print("✅ Mensaje enviado a Telegram")
+        else:
+            print(f"❌ Telegram error {resp.status_code}: {resp.text}")
+    except Exception as e:
+        print(f"❌ Telegram error: {e}")
+
+
+# ──────────────────────────────────────────────
+# API
+# ──────────────────────────────────────────────
 def get(endpoint: str, **params) -> dict:
-    """GET con retry."""
     for attempt in range(3):
         try:
             resp = requests.get(f"{BASE}{endpoint}", headers=HEADERS, params=params, timeout=30)
@@ -25,7 +54,6 @@ def get(endpoint: str, **params) -> dict:
         except requests.exceptions.HTTPError as e:
             if e.response.status_code == 429:
                 wait = int(e.response.headers.get("Retry-After", 5))
-                print(f"  ⏳ Rate limit, esperando {wait}s...")
                 time.sleep(wait)
             elif attempt < 2:
                 time.sleep(2 ** attempt)
@@ -34,192 +62,150 @@ def get(endpoint: str, **params) -> dict:
     return {}
 
 
-def implied_prob(decimal_odds: float) -> float:
-    return 1 / decimal_odds if decimal_odds and decimal_odds > 1 else 0.0
+def implied_prob(odds: float) -> float:
+    return 1 / odds if odds and odds > 1 else 0.0
 
 
-def remove_vig(probs: list[float]) -> list[float]:
-    """Elimina el margen del bookmaker."""
-    total = sum(probs)
-    if total == 0:
-        return probs
-    return [p / total for p in probs]
+# ──────────────────────────────────────────────
+# SCORING
+# ──────────────────────────────────────────────
+def score_match(match: dict, stats: dict, odds: dict) -> dict:
+    h_xg = float(stats.get("home", {}).get("xg", 0) or 0)
+    a_xg = float(stats.get("away", {}).get("xg", 0) or 0)
+    total_xg = h_xg + a_xg
 
+    h_poss = float(stats.get("home", {}).get("possession", 50) or 50)
+    poss_diff = abs(h_poss - (100 - h_poss))
 
-def fetch_match_detail(match_id: str) -> dict:
-    """Detalle del partido (incluye score HT)."""
-    return get(f"/football/matches/{match_id}")
+    h_sot = int(stats.get("home", {}).get("shots_on_target", 0) or 0)
+    a_sot = int(stats.get("away", {}).get("shots_on_target", 0) or 0)
+    total_sot = h_sot + a_sot
 
-
-def fetch_match_stats(match_id: str) -> dict:
-    """xG, posesión, tiros."""
-    return get(f"/football/matches/{match_id}/stats")
-
-
-def fetch_match_odds(match_id: str) -> dict:
-    """Cuotas pre-match (Bet365, Pinnacle, Betfair, Kambi)."""
-    return get(f"/football/matches/{match_id}/odds")
-
-
-def score_over_05_ht(match: dict, stats: dict, odds: dict) -> dict:
-    """
-    Heurística combinada para estimar P(Over 0.5 HT).
-    
-    Componentes:
-    - xG total (peso 40%)
-    - Posesión dominante (peso 15%)
-    - Tiros al arco (peso 15%)
-    - Cuota Over 2.5 FT como proxy (peso 30%)
-    """
-    # --- Stats ---
-    home_xg = float(stats.get("home", {}).get("xg", 0) or 0)
-    away_xg = float(stats.get("away", {}).get("xg", 0) or 0)
-    total_xg = home_xg + away_xg
-
-    home_poss = float(stats.get("home", {}).get("possession", 50) or 50)
-    away_poss = float(stats.get("away", {}).get("possession", 50) or 50)
-
-    home_sot = int(stats.get("home", {}).get("shots_on_target", 0) or 0)
-    away_sot = int(stats.get("away", {}).get("shots_on_target", 0) or 0)
-    total_sot = home_sot + away_sot
-
-    # --- Odds: Over 2.5 FT como proxy ---
-    ou_over_odds = None
-    ou_under_odds = None
+    ou_odds = None
     for bm in odds.get("bookmakers", []):
         tg = bm.get("markets", {}).get("total_goals", {})
-        if tg.get("over") and tg.get("under"):
-            ou_over_odds = float(tg["over"].get("last_seen") or tg["over"].get("opening") or 0)
-            ou_under_odds = float(tg["under"].get("last_seen") or tg["under"].get("opening") or 0)
+        if tg.get("over"):
+            ou_odds = float(tg["over"].get("last_seen") or tg["over"].get("opening") or 0)
             break
 
-    ou_over_implied = implied_prob(ou_over_odds) if ou_over_odds else None
-    ou_under_implied = implied_prob(ou_under_odds) if ou_under_odds else None
-
-    # No-vig fair probability para Over
-    ou_fair_over = None
-    if ou_over_implied and ou_under_implied:
-        fair = remove_vig([ou_over_implied, ou_under_implied])
-        ou_fair_over = fair[0]
-
-    # --- Score compuesto (0-100) ---
-    # 1) xG: >2.0 total → muy probable gol en HT
     xg_score = min(total_xg / 2.5, 1.0) * 40
-
-    # 2) Posesión: diferencia >10% sugiere dominio ofensivo
-    poss_diff = abs(home_poss - away_poss)
     poss_score = min(poss_diff / 25, 1.0) * 15
-
-    # 3) Tiros al arco: >8 SOT totales → alto volumen ofensivo
     sot_score = min(total_sot / 12, 1.0) * 15
+    odds_score = max(0, (implied_prob(ou_odds) - 0.45) / 0.30) * 30 if ou_odds else 0
 
-    # 4) Cuota Over 2.5: si fair prob > 55%, HT también es probable
-    odds_score = 0
-    if ou_fair_over:
-        odds_score = max(0, (ou_fair_over - 0.45) / 0.30) * 30
+    score = round(xg_score + poss_score + sot_score + odds_score, 1)
 
-    total_score = xg_score + poss_score + sot_score + odds_score
-
-    # --- Veredicto ---
-    if total_score >= 65:
-        verdict = "🟢 ALTA"
-    elif total_score >= 45:
-        verdict = "🟡 MEDIA"
+    if score >= 65:
+        verdict = "🟢"
+    elif score >= 45:
+        verdict = "🟡"
     else:
-        verdict = "🔴 BAJA"
+        verdict = "🔴"
 
     return {
         "total_xg": round(total_xg, 2),
-        "possession": f"{int(home_poss)}-{int(away_poss)}",
+        "possession": f"{int(h_poss)}-{int(100 - h_poss)}",
         "total_sot": total_sot,
-        "ou25_fair": f"{ou_fair_over:.1%}" if ou_fair_over else "N/A",
-        "score": round(total_score, 1),
+        "score": score,
         "verdict": verdict,
     }
 
 
-def scan_date(target_date: str, competition_id: str = None):
-    """Escanea todos los partidos de una fecha."""
-    params = {"date_from": target_date, "date_to": target_date}
-    if competition_id:
-        params["competition_id"] = competition_id
-
-    matches = get("/football/matches", **params)
-    if isinstance(matches, dict):
-        matches = matches.get("matches", [])
-
-    if not matches:
-        print(f"No se encontraron partidos para {target_date}")
-        return []
-
-    print(f"\n{'='*100}")
-    print(f"  OVER 0.5 HT SCANNER — {target_date} — {len(matches)} partidos")
-    print(f"{'='*100}\n")
-    print(f"{'Partido':<42} {'xG':>5} {'Pos':>9} {'SOT':>4} {'O/U2.5':>8} {'Score':>6}  Verdict")
-    print(f"{'-'*100}")
-
-    results = []
-    for i, m in enumerate(matches):
-        mid = m.get("id")
-        if not mid:
-            continue
-
-        name = f"{m.get('home_team',{}).get('name','?')} vs {m.get('away_team',{}).get('name','?')}"
-
-        # Solo partidos con xG disponible
-        if not m.get("xg_available", False):
-            print(f"{name:<42} {'—':>5} {'—':>9} {'—':>4} {'—':>8} {'—':>6}  ⚠️ sin xG")
-            continue
-
-        try:
-            stats = fetch_match_stats(mid)
-            odds = fetch_match_odds(mid)
-            result = score_over_05_ht(m, stats, odds)
-
-            # Si el partido ya terminó, mostrar resultado HT real
-            ht_home = m.get("score", {}).get("half_time_home", 0) or 0
-            ht_away = m.get("score", {}).get("half_time_away", 0) or 0
-            ht_total = ht_home + ht_away
-            ht_actual = f"HT {ht_home}-{ht_away}" if m.get("status") == "finished" else ""
-
-            print(f"{name:<42} {result['total_xg']:>5} {result['possession']:>9} "
-                  f"{result['total_sot']:>4} {result['ou25_fair']:>8} "
-                  f"{result['score']:>6}  {result['verdict']}  {ht_actual}")
-
-            result["match_id"] = mid
-            result["name"] = name
-            result["ht_actual"] = ht_total
-            result["status"] = m.get("status", "unknown")
-            results.append(result)
-
-        except Exception as e:
-            print(f"{name:<42} ERROR: {e}")
-
-        time.sleep(0.3)  # rate limit
-
-    return results
-
-
+# ──────────────────────────────────────────────
+# MAIN
+# ──────────────────────────────────────────────
 def main():
     today = date.today().isoformat()
-    comp = os.environ.get("COMPETITION_ID", "")  # opcional: comp_3039, comp_3033, etc.
+    print(f"📅 Escaneando partidos del {today}...")
 
-    results = scan_date(today, comp or None)
+    # 1) Obtener todos los match_ids del día
+    all_matches = []
+    page = 1
+    while True:
+        data = get("/football/matches", date_from=today, date_to=today, per_page=100, page=page)
+        if isinstance(data, dict):
+            data = data.get("matches", [])
+        if not data:
+            break
+        all_matches.extend(data)
+        meta = get("/football/matches", date_from=today, date_to=today, per_page=100, page=page)
+        total_pages = 1  # simplificado
+        if page >= total_pages:
+            break
+        page += 1
+        time.sleep(0.5)
 
-    # Resumen
+    # Filtrar: solo con xG + odds
+    valid = [m for m in all_matches if m.get("xg_available") and m.get("odds_available")]
+    print(f"Total: {len(all_matches)} | Con datos: {len(valid)}")
+
+    # 2) Procesar
+    results = []
+    for m in valid:
+        mid = m["id"]
+        name = f"{m['home_team']['name']} vs {m['away_team']['name']}"
+
+        try:
+            stats = get(f"/football/matches/{mid}/stats")
+            odds = get(f"/football/matches/{mid}/odds")
+            r = score_match(m, stats, odds)
+
+            # HT real si terminó
+            ht = ""
+            if m.get("status") == "finished":
+                ht_h = m.get("score", {}).get("half_time_home", 0) or 0
+                ht_a = m.get("score", {}).get("half_time_away", 0) or 0
+                hit = "✅" if (ht_h + ht_a) >= 1 else "❌"
+                ht = f" HT {ht_h}-{ht_a} {hit}"
+
+            r["name"] = name
+            r["ht"] = ht
+            results.append(r)
+            print(f"{r['verdict']} {name:<45} xG={r['total_xg']:.2f} SOT={r['total_sot']} Score={r['score']:>5}{ht}")
+        except Exception as e:
+            print(f"⚠️ {name}: {e}")
+
+        time.sleep(0.3)
+
+    # 3) Enviar a Telegram
     if results:
-        high = [r for r in results if "ALTA" in r["verdict"]]
-        medium = [r for r in results if "MEDIA" in r["verdict"]]
-        low = [r for r in results if "BAJA" in r["verdict"]]
+        high = [r for r in results if r["verdict"] == "🟢"]
+        medium = [r for r in results if r["verdict"] == "🟡"]
+        low = [r for r in results if r["verdict"] == "🔴"]
 
-        print(f"\n{'='*100}")
-        print(f"  RESUMEN: 🟢 {len(high)} | 🟡 {len(medium)} | 🔴 {len(low)}")
-        print(f"{'='*100}")
+        # Construir mensaje HTML
+        lines = [f"⚽ <b>OVER 0.5 HT — {today}</b>", ""]
 
         if high:
-            print("\n  🟢 ALTA PROBABILIDAD:")
+            lines.append(f"🟢 <b>ALTA ({len(high)})</b>")
             for r in high:
-                print(f"    • {r['name']} (score: {r['score']}, xG: {r['total_xg']})")
+                ht_part = f" → {r['ht'].strip()}" if r["ht"] else ""
+                lines.append(f"  {r['name']} | xG {r['total_xg']} | SOT {r['total_sot']} | <b>{r['score']}</b>{ht_part}")
+            lines.append("")
+
+        if medium:
+            lines.append(f"🟡 <b>MEDIA ({len(medium)})</b>")
+            for r in medium:
+                ht_part = f" → {r['ht'].strip()}" if r["ht"] else ""
+                lines.append(f"  {r['name']} | xG {r['total_xg']} | SOT {r['total_sot']} | {r['score']}{ht_part}")
+            lines.append("")
+
+        if low:
+            lines.append(f"🔴 <b>BAJA ({len(low)})</b>")
+            for r in low[:5]:  # máx 5 para no saturar
+                lines.append(f"  {r['name']} | xG {r['total_xg']} | {r['score']}")
+            if len(low) > 5:
+                lines.append(f"  ... y {len(low)-5} más")
+
+        lines.append("")
+        lines.append(f"Total: {len(results)} partidos analizados")
+
+        message = "\n".join(lines)
+        send_telegram(message)
+
+        # También guardar JSON (para artifact)
+        with open("scan_results.json", "w") as f:
+            json.dump(results, f, indent=2, ensure_ascii=False)
 
 
 if __name__ == "__main__":
