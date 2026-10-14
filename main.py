@@ -226,8 +226,21 @@ def main():
 
     all_matches = []
     page = 1
+    # Manejo robusto de paginación: si la API devuelve 400/404 para páginas fuera de rango,
+    # paramos la paginación en lugar de dejar que la excepción termine el job.
     while True:
-        data = get("/football/matches", date_from=today, date_to=today, per_page=100, page=page)
+        try:
+            data = get("/football/matches", date_from=today, date_to=today, per_page=100, page=page)
+        except requests.exceptions.HTTPError as exc:
+            status = exc.response.status_code if exc.response is not None else None
+            if status in (400, 404):
+                # Asumimos que la página solicitada está fuera de rango / inválida -> finalizar paginación
+                text = exc.response.text if exc.response is not None else ""
+                print(f"ℹ️ Recibido {status} al solicitar matches page {page}; deteniendo paginación. Response: {text}")
+                break
+            # Re-raise para otros errores (p.ej. 401/403/500) para que el comportamiento no silencie fallos reales.
+            raise
+
         if isinstance(data, dict):
             matches = data.get("matches") or []
         elif isinstance(data, list):
